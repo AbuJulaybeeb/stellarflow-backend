@@ -1,5 +1,10 @@
 import axios from "axios";
-import { MarketRateFetcher, MarketRate, calculateMedian } from "./types";
+import {
+  MarketRateFetcher,
+  MarketRate,
+  SourceTrustLevel,
+  calculateWeightedAverage,
+} from "./types";
 import { errorTracker } from "../errorTracker";
 import { webhookService } from "../webhook";
 
@@ -30,7 +35,12 @@ export class GHSRateFetcher implements MarketRateFetcher {
   }
 
   async fetchRate(): Promise<MarketRate> {
-    const prices: { rate: number; timestamp: Date; source: string }[] = [];
+    const prices: {
+      rate: number;
+      timestamp: Date;
+      source: string;
+      trustLevel: SourceTrustLevel;
+    }[] = [];
 
     // Strategy 1: Try CoinGecko direct GHS price
     try {
@@ -58,6 +68,7 @@ export class GHSRateFetcher implements MarketRateFetcher {
           rate: stellarPrice.ghs,
           timestamp: lastUpdatedAt,
           source: "CoinGecko (direct)",
+          trustLevel: "standard",
         });
         
         // Success - reset error tracker
@@ -113,6 +124,7 @@ export class GHSRateFetcher implements MarketRateFetcher {
             timestamp:
               fxTimestamp > lastUpdatedAt ? fxTimestamp : lastUpdatedAt,
             source: "CoinGecko + ExchangeRate API",
+            trustLevel: "trusted",
           });
           
           // Success - reset error tracker
@@ -157,6 +169,7 @@ export class GHSRateFetcher implements MarketRateFetcher {
               rate: xlmUsd * ghsRate,
               timestamp: new Date(),
               source: "Alternative XLM pricing",
+              trustLevel: "new",
             });
             
             // Success - reset error tracker
@@ -170,8 +183,9 @@ export class GHSRateFetcher implements MarketRateFetcher {
 
     // If we have prices, calculate median
     if (prices.length > 0) {
-      const rateValues = prices.map((p) => p.rate);
-      const medianRate = calculateMedian(rateValues);
+      const weightedRate = calculateWeightedAverage(
+        prices.map((p) => ({ value: p.rate, trustLevel: p.trustLevel })),
+      );
       const mostRecentTimestamp = prices.reduce(
         (latest, p) => (p.timestamp > latest ? p.timestamp : latest),
         prices[0]?.timestamp ?? new Date(),
@@ -179,9 +193,9 @@ export class GHSRateFetcher implements MarketRateFetcher {
 
       return {
         currency: "GHS",
-        rate: medianRate,
+        rate: weightedRate,
         timestamp: mostRecentTimestamp,
-        source: `Median of ${prices.length} sources`,
+        source: `Weighted average of ${prices.length} sources`,
       };
     }
 

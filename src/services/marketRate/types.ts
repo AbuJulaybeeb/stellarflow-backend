@@ -95,6 +95,11 @@ export interface HealthCheckResponse {
 }
 
 /**
+ * Source trust tier used when weighting multi-source rates.
+ */
+export type SourceTrustLevel = "trusted" | "standard" | "new";
+
+/**
  * Calculate the median of an array of numbers
  * This helps prevent a single bad API from ruining the data
  * @param values - Array of price numbers from different sources
@@ -129,6 +134,43 @@ export function calculateAverage(prices: number[]): number {
 
   const sum = prices.reduce((acc, price) => acc + price, 0);
   return sum / prices.length;
+}
+
+export interface WeightedPriceInput {
+  value: number;
+  trustLevel?: SourceTrustLevel;
+  weight?: number;
+}
+
+const SOURCE_TRUST_WEIGHTS: Record<SourceTrustLevel, number> = {
+  trusted: 3,
+  standard: 2,
+  new: 1,
+};
+
+/**
+ * Calculate weighted average from source values.
+ * Use explicit `weight` when provided, otherwise derive by trust level.
+ */
+export function calculateWeightedAverage(values: WeightedPriceInput[]): number {
+  if (values.length === 0) return 0;
+
+  let weightedSum = 0;
+  let totalWeight = 0;
+
+  for (const value of values) {
+    const trustWeight = SOURCE_TRUST_WEIGHTS[value.trustLevel ?? "standard"];
+    const weight =
+      typeof value.weight === "number" && Number.isFinite(value.weight) && value.weight > 0
+        ? value.weight
+        : trustWeight;
+
+    weightedSum += value.value * weight;
+    totalWeight += weight;
+  }
+
+  if (totalWeight === 0) return 0;
+  return weightedSum / totalWeight;
 }
 
 /**
