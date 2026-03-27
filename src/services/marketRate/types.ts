@@ -171,7 +171,9 @@ export function calculateWeightedAverage(values: WeightedPriceInput[]): number {
   for (const value of values) {
     const trustWeight = SOURCE_TRUST_WEIGHTS[value.trustLevel ?? "standard"];
     const weight =
-      typeof value.weight === "number" && Number.isFinite(value.weight) && value.weight > 0
+      typeof value.weight === "number" &&
+      Number.isFinite(value.weight) &&
+      value.weight > 0
         ? value.weight
         : trustWeight;
 
@@ -187,7 +189,11 @@ export function calculateWeightedAverage(values: WeightedPriceInput[]): number {
  * Rate Fetch Statistics
  * Performance and reliability metrics
  */
-export { filterOutliers, isOutlier, percentDeviation } from '../../logic/outlierFilter';
+export {
+  filterOutliers,
+  isOutlier,
+  percentDeviation,
+} from "../../logic/outlierFilter";
 
 export interface RateFetchStats {
   totalRequests: number;
