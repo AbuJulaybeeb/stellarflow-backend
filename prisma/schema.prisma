@@ -1,6 +1,3 @@
-// Prisma Schema for StellarFlow Backend
-// PostgreSQL database schema for price history tracking
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -9,28 +6,21 @@ datasource db {
   provider = "postgresql"
 }
 
-// Price History Model
-// Stores historical exchange rates for sparkline charts
 model PriceHistory {
   id          Int       @id @default(autoincrement())
-  currency    String    @db.VarChar(10)  // e.g., "GHS", "KES"
-  rate        Decimal   @db.Decimal(20, 10)  // High precision for exchange rates
-  source      String    @db.VarChar(100)  // Source API name
-  timestamp   DateTime  @db.Timestamp(3)  // When the rate was recorded
-  
-  // Indexes for efficient sparkline queries
-  @@index([currency, timestamp])
-  @@index([timestamp])
-  
-  // Unique constraint to prevent duplicate entries at same timestamp from same source
-  @@unique([currency, source, timestamp])
-  
+  currency    String    @db.VarChar(10)
+  rate        Decimal   @db.Decimal(20, 10)
+  source      String    @db.VarChar(100)
+  timestamp   DateTime  @db.Timestamp(3)
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
+  currencyRef Currency? @relation(fields: [currency], references: [code])
+
+  @@index([currency, timestamp])
+  @@index([timestamp])
+  @@unique([currency, source, timestamp])
 }
 
-// Currency Configuration Model
-// Stores supported currencies and their metadata
 model Currency {
   code        String    @id @db.VarChar(10)  // e.g., "GHS", "KES"
   name        String    @db.VarChar(100)      // Full name e.g., "Ghanaian Cedi"
@@ -61,8 +51,6 @@ model OnChainPrice {
   createdAt     DateTime  @default(now())
 }
 
-// Provider Reputation Model
-// Tracks API reliability and performance
 model ProviderReputation {
   id              Int       @id @default(autoincrement())
   providerName    String    @db.VarChar(100)  // e.g., "CoinGecko", "ExchangeRateAPI"
