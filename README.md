@@ -296,3 +296,4 @@ See [ROADMAP.md](./ROADMAP.md) for the full product roadmap and milestone struct
 - **v1.0** — Mainnet Launch (Q4 2026)
 
 All open issues are triaged and assigned to a milestone. Contributors can see what is planned, in progress, or blocked.
+
