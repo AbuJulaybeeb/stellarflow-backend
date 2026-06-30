@@ -4,7 +4,6 @@ src/crypto/signer.py
 Context-managed signing primitive that enforces strict key-lifetime isolation.
 
 COMPREHENSIVE MEMORY SECURITY ARCHITECTURE
-==========================================
 
 This module implements defense-in-depth memory security for cryptographic
 operations. The design addresses the critical vulnerability where automated
@@ -115,7 +114,7 @@ import os
 import platform
 import threading
 from types import TracebackType
-from typing import Optional, Type
+from typing import Iterator, Optional, Type
 
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger(f"{__name__}.audit")
@@ -629,6 +628,11 @@ class SecureSessionCredentials:
             token = creds.get()
             # use token for validation ...
         # Buffer zero-wiped here; creds is no longer usable.
+
+    Prefer the :meth:`use` method over :meth:`get` when possible — it
+    accepts a callback and wipes the temporary ``bytes`` view in a
+    ``finally`` block, minimising the window during which credential
+    material is recoverable from a heap dump.
     """
 
     __slots__ = ("_buf", "_active", "_wiped", "_credential_type", "_locked")
@@ -694,7 +698,7 @@ class SecureSessionCredentials:
         audit_log.log_key_revoked(f"cred_{self._credential_type}", reason="scope_exit")
 
     # ------------------------------------------------------------------
-    # Accessor
+    # Accessors
     # ------------------------------------------------------------------
 
     def get(self) -> bytes:
@@ -717,56 +721,46 @@ class SecureSessionCredentials:
             )
         return bytes(self._buf)
 
+    def use(self, callback):
+        """Pass the session credentials to *callback* and wipe the temporary
+        copy immediately after the callback returns (or raises).
 
-class SecureVariableWrapper:
-    """Context manager for generic sensitive variable isolation."""
-    __slots__ = ("_buf", "_active", "_wiped", "_label", "_locked")
+        This is the **preferred** way to consume credentials because the
+        intermediate ``bytes`` view is overwritten in a ``finally`` block,
+        minimising the window during which the credential material is
+        recoverable from a process memory dump.
 
-    def __init__(self, data: bytes, label: str = "generic_secret") -> None:
-        if not data:
-            raise ValueError("data must be non-empty bytes.")
-        self._buf: bytearray = bytearray(data)
-        self._active: bool = False
-        self._wiped: bool = False
-        self._label: str = label
-        self._locked: bool = _mlock_buffer(self._buf)
+        Args:
+            callback: A callable ``fn(credentials: bytes) -> T`` that
+                      receives the credential bytes for the duration of
+                      the call.  The return value of *callback* is
+                      forwarded as the return value of :meth:`use`.
 
-    def __enter__(self) -> "SecureVariableWrapper":
-        self._active = True
-        logger.debug("[SecureVariableWrapper] Scope opened for: %s", self._label)
-        audit_log.log_key_imported(self._label, len(self._buf))
-        return self
+        Returns:
+            The return value of *callback*.
 
-    def __exit__(
-        self,
-        exc_type: Optional[Type[BaseException]],
-        exc_val: Optional[BaseException],
-        exc_tb: Optional[TracebackType],
-    ) -> bool:
-        self._active = False
-        self._do_wipe()
-        return False
+        Raises:
+            SigningError: If called outside the ``with`` block or after the
+                          buffer has already been wiped.
 
-    def __del__(self) -> None:
-        try:
-            self._do_wipe()
-        except Exception:
-            pass
+        Example::
 
-    def _do_wipe(self) -> None:
-        if self._wiped:
-            return
-        self._wiped = True
-        _zero_wipe(self._buf, audit_details={"object_type": "SecureVariableWrapper"})
-        if self._locked:
-            _munlock_buffer(self._buf)
-            self._locked = False
-        logger.debug("[SecureVariableWrapper] Scope closed — data wiped.")
-        audit_log.log_key_revoked(self._label, reason="scope_exit")
-
-    def get(self) -> bytes:
+            with SecureSessionCredentials(token_bytes) as creds:
+                api_token = creds.use(lambda tok: verify(tok))
+            # Temporary bytes copy zero-wiped here; creds is no longer usable.
+        """
         if not self._active:
-            raise SigningError("SecureVariableWrapper.get() called outside an active context.")
+            raise SigningError(
+                "SecureSessionCredentials.use() called outside an active validation scope. "
+                "Use 'with SecureSessionCredentials(...) as creds:' and call use() inside."
+            )
         if self._wiped:
-            raise SigningError("SecureVariableWrapper.get() called after the wrapper has been wiped.")
-        return bytes(self._buf)
+            raise SigningError(
+                "SecureSessionCredentials.use() called after credentials have been wiped."
+            )
+        temp: bytes = bytes(self._buf)
+        try:
+            return callback(temp)
+        finally:
+            _wipe_bytes_view(temp)
+            del temp
