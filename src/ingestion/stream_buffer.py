@@ -53,26 +53,25 @@ class StreamBuffer:
         self._buf[end : end + len(payload)] = payload
         self._size += len(payload)
 
-        frames: list[bytes] = []
-        start = 0
+        limit = self._start + self._size
+        cursor = self._start
 
-        view = memoryview(self._buf)[self._start : self._start + self._size]
-        for i in range(len(view)):
-            if view[i] == _NEWLINE:
-                if i > start:
-                    frames.append(bytes(view[start:i]))
-                start = i + 1
-        consumed = start
-        view.release()
+        while True:
+            pos = self._buf.find(b'\n', cursor, limit)
+            if pos == -1:
+                break
+            if pos > cursor:
+                frame_view = memoryview(self._buf)[cursor:pos]
+                yield json.loads(frame_view)
+            cursor = pos + 1
+
+        consumed = cursor - self._start
 
         if consumed:
             self._start += consumed
             self._size -= consumed
             if self._size == 0:
                 self._start = 0
-
-        for frame in frames:
-            yield json.loads(frame)
 
     def reset(self) -> None:
         """Discard all buffered data while keeping the backing storage reusable."""
