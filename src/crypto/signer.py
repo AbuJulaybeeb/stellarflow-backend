@@ -112,6 +112,8 @@ import ctypes.util
 import hashlib
 import logging
 import os
+import platform
+import threading
 from types import TracebackType
 from typing import Optional, Type
 
@@ -125,6 +127,7 @@ __all__ = [
     "SigningError",
     "MemorySecurityError",
     "SecurityAuditLogger",
+    "audit_log",
 ]
 
 # =========================================================================
@@ -144,11 +147,52 @@ class SecurityAuditLogger:
     
     Audit logs should be persisted to a secure, tamper-evident log service.
     """
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._operations = []
 
-__all__ = ["SecureKeyHandle", "SecureSessionCredentials", "SigningError"]
+    def log_key_imported(self, key_id: str, key_size_bytes: int) -> None:
+        with self._lock:
+            self._operations.append({
+                'event': 'KEY_IMPORTED',
+                'key_id': key_id,
+                'key_size_bytes': key_size_bytes
+            })
+
+    def log_signing_operation(self, key_id: str, key_size_bytes: int) -> None:
+        with self._lock:
+            self._operations.append({
+                'event': 'SIGNING_OPERATION',
+                'key_id': key_id
+            })
+
+    def log_key_revoked(self, key_id: str, reason: str) -> None:
+        with self._lock:
+            self._operations.append({
+                'event': 'KEY_REVOKED',
+                'key_id': key_id,
+                'reason': reason
+            })
+
+    def log_memory_cleanup(self, object_type: str, buffer_size: int, wipe_method: str = "ctypes.memset") -> None:
+        with self._lock:
+            self._operations.append({
+                'event': 'MEMORY_CLEANUP',
+                'object_type': object_type,
+                'buffer_size': buffer_size,
+                'wipe_method': wipe_method
+            })
+
+    def get_audit_trail(self) -> list:
+        with self._lock:
+            return list(self._operations)
 
 
-def _zero_wipe(buf: bytearray) -> None:
+audit_log = SecurityAuditLogger()
+
+
+
+def _zero_wipe(buf: bytearray, audit_details: Optional[dict] = None) -> None:
     """Overwrite *buf* in-place with zeros."""
     if len(buf) == 0:
         return
@@ -343,6 +387,64 @@ def _munlock_buffer(buf: bytearray) -> None:
 # EXCEPTIONS
 # =========================================================================
 
+class MemorySecurityError(Exception):
+    """Raised when memory locking or hardening fails or is violated."""
+
+
+class SigningError(Exception):
+    """Raised when signing fails or the key handle is no longer usable."""
+
+
+def _wipe_bytes_object(obj: bytes) -> None:
+    """Best-effort in-place overwrite of CPython bytes object data."""
+    if not isinstance(obj, bytes) or len(obj) == 0:
+        return
+    try:
+        is_64bit = (ctypes.sizeof(ctypes.c_void_p) == 8)
+        offset = 32 if is_64bit else 16
+        addr = id(obj) + offset
+        ctypes.memset(addr, 0, len(obj))
+    except Exception:
+        pass
+
+
+def _wipe_key_handle(handle) -> None:
+    """Clean up sensitive fields of keypair/signing key objects in memory."""
+    if handle is None:
+        return
+    try:
+        if isinstance(handle, bytes):
+            _wipe_bytes_object(handle)
+        
+        for attr in ("_seed", "_signing_key", "_verifier", "_key", "seed", "secret_key"):
+            if hasattr(handle, attr):
+                val = getattr(handle, attr, None)
+                if val is not None:
+                    if isinstance(val, (bytes, bytearray)):
+                        if isinstance(val, bytearray):
+                            _zero_wipe(val)
+                        else:
+                            _wipe_bytes_object(val)
+                    elif type(val).__name__ in ("SigningKey", "VerifyKey", "Keypair"):
+                        _wipe_key_handle(val)
+    except Exception:
+        pass
+
+
+class _SecureKeypairContext:
+    """Strict context manager around key handles."""
+    def __init__(self, handle, key_bytes: bytes) -> None:
+        self.handle = handle
+        self.key_bytes = key_bytes
+
+    def __enter__(self) -> "_SecureKeypairContext":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        _wipe_key_handle(self.handle)
+        _wipe_bytes_object(self.key_bytes)
+
+
 def _unlock_memory(buf: bytearray) -> None:
     """Best-effort unlock for previously locked key memory."""
     if len(buf) == 0:
@@ -476,7 +578,8 @@ class SecureKeyHandle:
 
         try:
             keypair = Keypair.from_raw_ed25519_seed(key_bytes)
-            return bytes(keypair.sign(tx_hash))
+            with _SecureKeypairContext(keypair, key_bytes):
+                return bytes(keypair.sign(tx_hash))
         except Exception as exc:
             raise SigningError("Signing failed (stellar_sdk path).") from exc
 
@@ -492,7 +595,8 @@ class SecureKeyHandle:
 
         try:
             sk = SigningKey(key_bytes)
-            return bytes(sk.sign(tx_hash).signature)
+            with _SecureKeypairContext(sk, key_bytes):
+                return bytes(sk.sign(tx_hash).signature)
         except Exception as exc:
             raise SigningError("Signing failed (PyNaCl path).") from exc
 
@@ -611,4 +715,58 @@ class SecureSessionCredentials:
             raise SigningError(
                 "SecureSessionCredentials.get() called after credentials have been wiped."
             )
+        return bytes(self._buf)
+
+
+class SecureVariableWrapper:
+    """Context manager for generic sensitive variable isolation."""
+    __slots__ = ("_buf", "_active", "_wiped", "_label", "_locked")
+
+    def __init__(self, data: bytes, label: str = "generic_secret") -> None:
+        if not data:
+            raise ValueError("data must be non-empty bytes.")
+        self._buf: bytearray = bytearray(data)
+        self._active: bool = False
+        self._wiped: bool = False
+        self._label: str = label
+        self._locked: bool = _mlock_buffer(self._buf)
+
+    def __enter__(self) -> "SecureVariableWrapper":
+        self._active = True
+        logger.debug("[SecureVariableWrapper] Scope opened for: %s", self._label)
+        audit_log.log_key_imported(self._label, len(self._buf))
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> bool:
+        self._active = False
+        self._do_wipe()
+        return False
+
+    def __del__(self) -> None:
+        try:
+            self._do_wipe()
+        except Exception:
+            pass
+
+    def _do_wipe(self) -> None:
+        if self._wiped:
+            return
+        self._wiped = True
+        _zero_wipe(self._buf, audit_details={"object_type": "SecureVariableWrapper"})
+        if self._locked:
+            _munlock_buffer(self._buf)
+            self._locked = False
+        logger.debug("[SecureVariableWrapper] Scope closed — data wiped.")
+        audit_log.log_key_revoked(self._label, reason="scope_exit")
+
+    def get(self) -> bytes:
+        if not self._active:
+            raise SigningError("SecureVariableWrapper.get() called outside an active context.")
+        if self._wiped:
+            raise SigningError("SecureVariableWrapper.get() called after the wrapper has been wiped.")
         return bytes(self._buf)
