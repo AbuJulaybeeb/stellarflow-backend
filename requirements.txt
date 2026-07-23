@@ -11,3 +11,6 @@ pysimdjson>=5.0.2
 
 # Async HTTP client used by rest_fallback.py
 aiohttp>=3.9.0
+
+# Async PostgreSQL driver for high-performance bulk inserts
+asyncpg>=0.28.0

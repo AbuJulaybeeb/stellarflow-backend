@@ -43,18 +43,25 @@ PartitionedTelemetryWriter usage::
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
-
-from .batch_sink import BatchSink
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_FLUSH_INTERVAL_MS = 1000.0
+DEFAULT_ASYNC_BATCH_SIZE = 1000
+DEFAULT_ASYNC_FLUSH_INTERVAL_MS = 100.0
+
+
+try:
+    import asyncpg
+except ImportError:
+    asyncpg = None
 
 
 def _execute_values_bulk(cursor: Any, sql: str, values: List[tuple], page_size: int) -> None:
@@ -66,6 +73,32 @@ def _execute_values_bulk(cursor: Any, sql: str, values: List[tuple], page_size: 
             "psycopg2 is required for RelationalWriter bulk inserts"
         ) from exc
     execute_values(cursor, sql, values, page_size=page_size)
+
+
+class DatabaseWriter:
+    """Simple database writer for inserting batches of rows."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def insert_batch(self, table_name, batch, commit=True):
+        if not batch:
+            return
+        columns = list(batch[0].keys())
+        column_clause = ", ".join(columns)
+        sql = f"INSERT INTO {table_name} ({column_clause}) VALUES %s"
+        values = [tuple(row[col] for col in columns) for row in batch]
+        cursor = self.connection.cursor()
+        try:
+            _execute_values_bulk(cursor, sql, values, page_size=len(values))
+            if commit:
+                self.connection.commit()
+        except Exception:
+            if commit:
+                self.connection.rollback()
+            raise
+        finally:
+            cursor.close()
 
 
 # ---------------------------------------------------------------------------
@@ -250,12 +283,13 @@ class PartitionedTelemetryWriter:
 
     def __init__(
         self,
-        base_sink: BatchSink,
+        base_sink: Any,
         base_table: str = "telemetry",
         timestamp_field: str = "ts",
         schema_source: Optional[Dict[str, str]] = None,
         create_if_missing: bool = True,
     ) -> None:
+        from .batch_sink import BatchSink
         if base_sink is None:
             raise ValueError("base_sink must not be None")
 
@@ -365,3 +399,152 @@ class PartitionedTelemetryWriter:
         """Return the set of partition table names created by this writer."""
         with self._lock:
             return set(self._known_partitions)
+
+
+# ---------------------------------------------------------------------------
+# AsyncRelationalWriter - Async PostgreSQL bulk insert using asyncpg COPY
+# ---------------------------------------------------------------------------
+
+class AsyncRelationalWriter:
+    """
+    Async, thread-safe (for the buffer) database writer using asyncpg's COPY
+    protocol with binary formatting for high-performance bulk inserts.
+    """
+
+    def __init__(
+        self,
+        connection: Any,
+        table_name: str = "telemetry",
+        batch_size: int = DEFAULT_ASYNC_BATCH_SIZE,
+        flush_interval_ms: float = DEFAULT_ASYNC_FLUSH_INTERVAL_MS,
+    ):
+        if asyncpg is None:
+            raise ImportError("asyncpg is required for AsyncRelationalWriter")
+
+        # Allow mocks for testing
+        import unittest.mock
+        if not (
+            isinstance(connection, asyncpg.Connection)
+            or isinstance(connection, (unittest.mock.Mock, unittest.mock.AsyncMock))
+        ):
+            raise TypeError("connection must be an instance of asyncpg.Connection")
+
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        if flush_interval_ms <= 0:
+            raise ValueError("flush_interval_ms must be positive")
+
+        self._conn = connection
+        self._table = table_name
+        self._batch_size = batch_size
+        self._interval = flush_interval_ms / 1000.0
+
+        self._buffer: List[Dict[str, Any]] = []
+        self._buffer_lock = asyncio.Lock()
+        self._flush_lock = asyncio.Lock()
+        self._stop_event = asyncio.Event()
+        self._flush_task: Optional[asyncio.Task] = None
+
+        # Track columns to ensure consistency across buffer
+        self._columns: Optional[List[str]] = None
+
+        logger.debug(
+            "AsyncRelationalWriter initialized for table %s "
+            "(batch_size=%d, flush_interval_ms=%.0f)",
+            self._table,
+            self._batch_size,
+            flush_interval_ms,
+        )
+
+    async def start(self) -> None:
+        """Start the background flush loop."""
+        if self._flush_task is not None and not self._flush_task.done():
+            return
+        self._stop_event.clear()
+        self._flush_task = asyncio.create_task(self._run())
+
+    async def save(self, data: Dict[str, Any]) -> None:
+        """
+        Add a record to the buffer. Triggers an immediate flush if the buffer
+        reaches batch_size.
+        """
+        if not isinstance(data, dict):
+            raise TypeError("data must be a dict mapping column names to values")
+
+        async with self._buffer_lock:
+            if self._columns is None:
+                self._columns = list(data.keys())
+            else:
+                if list(data.keys()) != self._columns:
+                    raise ValueError("All records must have the same columns")
+
+            self._buffer.append(data)
+            should_flush = len(self._buffer) >= self._batch_size
+
+        if should_flush:
+            await self._flush()
+
+    async def _run(self) -> None:
+        """Background worker that flushes buffered rows on a fixed interval."""
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self._interval)
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._flush()
+            except Exception as exc:
+                logger.exception(
+                    "Unexpected error while flushing AsyncRelationalWriter: %s", exc
+                )
+
+    async def _flush(self) -> None:
+        """
+        Bulk-insert buffered rows using asyncpg's copy_records_to_table with
+        binary format.
+        """
+        async with self._flush_lock:
+            async with self._buffer_lock:
+                if not self._buffer:
+                    return
+                batch = self._buffer.copy()
+                self._buffer.clear()
+
+            logger.debug(
+                "Flushing %d records to table %s via asyncpg COPY binary",
+                len(batch),
+                self._table,
+            )
+
+            try:
+                # Convert records to tuples in column order
+                records = [tuple(record[col] for col in self._columns) for record in batch]
+                await self._conn.copy_records_to_table(
+                    self._table,
+                    records=records,
+                    columns=self._columns,
+                    format="binary",
+                )
+                logger.debug("Successfully flushed %d records", len(batch))
+            except Exception:
+                # Re-queue the batch on failure
+                async with self._buffer_lock:
+                    self._buffer = batch + self._buffer
+                logger.exception("Failed to flush AsyncRelationalWriter; records re-queued")
+                raise
+
+    async def shutdown(self) -> None:
+        """Stop the background flusher and persist any remaining rows."""
+        self._stop_event.set()
+        if self._flush_task is not None:
+            await self._flush_task
+        try:
+            await self._flush()
+        except Exception as exc:
+            logger.exception(
+                "Error during final AsyncRelationalWriter shutdown flush: %s", exc
+            )
+        logger.info(
+            "AsyncRelationalWriter shutdown complete; %d records remaining in buffer",
+            len(self._buffer),
+        )

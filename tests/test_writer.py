@@ -1,22 +1,34 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from database.writer import DEFAULT_BATCH_SIZE, RelationalWriter
+from database.writer import (
+    DEFAULT_BATCH_SIZE,
+    RelationalWriter,
+    AsyncRelationalWriter,
+    asyncpg,
+)
 
 
 def _make_connection() -> MagicMock:
     conn = MagicMock()
     cursor = MagicMock()
     conn.cursor.return_value = cursor
+    return conn
+
+
+def _make_asyncpg_connection() -> AsyncMock:
+    conn = AsyncMock()
+    conn.copy_records_to_table = AsyncMock()
     return conn
 
 
@@ -105,3 +117,29 @@ def test_shutdown_flushes_remaining_rows():
         writer.shutdown()
         execute_values.assert_called_once()
         assert execute_values.call_args.args[2] == [("solo", 99)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(asyncpg is None, reason="asyncpg not installed")
+async def test_copy_binary_stream():
+    conn = _make_asyncpg_connection()
+    writer = AsyncRelationalWriter(
+        conn, batch_size=3, flush_interval_ms=60_000
+    )
+
+    try:
+        await writer.start()
+        for index in range(3):
+            await writer.save({"asset_id": f"asset-{index}", "price": index})
+
+        # Give it a moment to flush
+        await asyncio.sleep(0.1)
+
+        conn.copy_records_to_table.assert_called_once()
+        call_args = conn.copy_records_to_table.call_args
+        assert call_args.args[0] == "telemetry"
+        assert call_args.kwargs["columns"] == ["asset_id", "price"]
+        assert call_args.kwargs["format"] == "binary"
+        assert len(call_args.kwargs["records"]) == 3
+    finally:
+        await writer.shutdown()
