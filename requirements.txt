@@ -14,3 +14,7 @@ aiohttp>=3.9.0
 
 # Async PostgreSQL driver for high-performance bulk inserts
 asyncpg>=0.28.0
+
+# Test/benchmark verification
+pytest>=8.0.0
+pytest-benchmark>=4.0.0
