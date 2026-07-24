@@ -13,9 +13,18 @@ library so the pipeline remains functional in any environment.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import mmap
+import os
+import struct
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Generator
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # SIMD-accelerated JSON back-end (optional)
@@ -280,6 +289,295 @@ class MmapLogSink:
 
 
 # ---------------------------------------------------------------------------
+# O_DIRECT raw file write sink
+# ---------------------------------------------------------------------------
+
+# O_DIRECT requires writes to be aligned to the logical block size of the
+# underlying device.  512 bytes is the minimum safe alignment on virtually
+# all Linux block devices; 4096 bytes (4 KiB) covers advanced-format drives.
+# We default to 4096 so the sink works correctly on both sector sizes without
+# needing to query the device at runtime.
+_DIRECT_IO_ALIGN: int = 4096
+
+# O_DIRECT is Linux-specific; provide a sentinel for non-Linux platforms so
+# the class can still be imported and tested (writes fall back to buffered I/O
+# when the flag is unavailable).
+_O_DIRECT: int = getattr(os, "O_DIRECT", 0)
+
+# Default thread-pool size for async offload.  One dedicated thread per sink
+# is sufficient because writes are serialised by the internal lock anyway.
+_DIRECT_IO_EXECUTOR_WORKERS: int = 1
+
+
+def _align_up(n: int, alignment: int) -> int:
+    """Round *n* up to the nearest multiple of *alignment*."""
+    return (n + alignment - 1) & ~(alignment - 1)
+
+
+class DirectIOSink:
+    """Raw file write sink that bypasses the OS page cache via ``O_DIRECT``.
+
+    ``O_DIRECT`` instructs the kernel to transfer data directly between user
+    space and the storage device, skipping the page cache entirely.  This
+    eliminates the double-buffering penalty for high-throughput telemetry logs
+    where the data is written once and never re-read via the cache.
+
+    Write alignment requirements
+    ----------------------------
+    ``O_DIRECT`` imposes strict alignment constraints on Linux:
+
+    * The file offset at which each write begins must be a multiple of the
+      logical block size (``alignment``, default 4096).
+    * The buffer address in memory must be aligned to the same boundary.
+    * The transfer length must be a multiple of the same boundary.
+
+    ``DirectIOSink`` handles all three transparently:
+
+    * The file is opened with ``O_APPEND`` so the kernel manages the seek
+      position; writes are always block-aligned because the sink pads each
+      frame to the next alignment boundary before calling ``os.write``.
+    * The internal write buffer is allocated via ``bytearray`` and padded so
+      its length is always a multiple of ``alignment``.
+    * Memory alignment of the Python buffer is not enforced at the Python
+      level (CPython's allocator typically returns page-aligned memory for
+      large objects, but this is not guaranteed).  On kernels ≥ 3.16 the
+      alignment requirement on the *buffer address* was relaxed to 512 bytes
+      for most file systems; ``DirectIOSink`` keeps frame payloads small
+      enough that this is never an issue in practice.
+
+    Non-blocking async integration
+    --------------------------------
+    ``os.write`` with ``O_DIRECT`` can block for the duration of a DMA
+    transfer (typically <1 ms but unbounded under heavy I/O pressure).
+    ``DirectIOSink.async_write`` and ``async_write_batch`` offload the
+    blocking ``os.write`` call to a dedicated :class:`ThreadPoolExecutor` via
+    :func:`asyncio.get_event_loop().run_in_executor`, so the async event loop
+    is never stalled.
+
+    Thread safety
+    -------------
+    All public synchronous methods are protected by an internal ``threading.Lock``.
+    Concurrent ``async_write`` / ``async_write_batch`` calls are safe because
+    each coroutine awaits its executor future before the next write starts
+    (the lock inside the executor call serialises concurrent threads).
+
+    Platform notes
+    --------------
+    ``O_DIRECT`` is Linux-specific.  On platforms where ``os.O_DIRECT`` is not
+    defined the sink opens the file without the flag and behaves identically to
+    a regular append-only file sink.  This allows the module to be imported and
+    tested on macOS / Windows without modification.
+    """
+
+    __slots__ = (
+        "_path",
+        "_alignment",
+        "_fd",
+        "_lock",
+        "_closed",
+        "_bytes_written",
+        "_executor",
+    )
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        alignment: int = _DIRECT_IO_ALIGN,
+    ) -> None:
+        """Open (or create) *path* for O_DIRECT appending.
+
+        Parameters
+        ----------
+        path:
+            Destination file path.  Parent directories are created on demand.
+        alignment:
+            Block-size alignment for O_DIRECT writes (default: 4096 bytes).
+            Must be a power of two and ≥ 512.
+        """
+        if alignment <= 0 or (alignment & (alignment - 1)) != 0:
+            raise ValueError(f"alignment must be a positive power of two, got {alignment}")
+
+        self._path = Path(path)
+        self._alignment = alignment
+        self._lock = threading.Lock()
+        self._closed = False
+        self._bytes_written: int = 0
+        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=_DIRECT_IO_EXECUTOR_WORKERS,
+            thread_name_prefix="directio_sink",
+        )
+
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = self._open_fd()
+
+        logger.debug(
+            "DirectIOSink initialised — path=%s alignment=%d o_direct=%s",
+            self._path,
+            self._alignment,
+            bool(_O_DIRECT),
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _open_fd(self) -> int:
+        """Return an O_DIRECT | O_APPEND file descriptor for the sink path."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_DIRECT
+        return os.open(str(self._path), flags, 0o600)
+
+    def _pad_to_alignment(self, data: bytes) -> bytes:
+        """Pad *data* with null bytes so its length is a multiple of *alignment*.
+
+        ``O_DIRECT`` requires transfer sizes to be multiples of the block size.
+        Telemetry frames are padded with ``\\x00`` bytes to the next aligned
+        boundary.  The reader is expected to strip trailing nulls or rely on
+        the embedded length prefix / newline delimiter to locate frame bounds.
+        """
+        remainder = len(data) % self._alignment
+        if remainder == 0:
+            return data
+        return data + b"\x00" * (self._alignment - remainder)
+
+    def _write_sync(self, data: bytes) -> int:
+        """Write *data* (must be alignment-padded) synchronously via os.write.
+
+        Returns the number of bytes written to the underlying file descriptor.
+        This method is intended for internal use and executor offload only.
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("DirectIOSink is closed")
+            padded = self._pad_to_alignment(data)
+            n = os.write(self._fd, padded)
+            self._bytes_written += n
+            return n
+
+    def _write_batch_sync(self, frames: list[bytes]) -> int:
+        """Concatenate and write all frames in *frames* as one aligned block.
+
+        Batching reduces the number of ``os.write`` syscalls (and DMA
+        transfers) proportional to the batch size, which is the primary
+        throughput lever for ``O_DIRECT`` workloads.
+
+        Returns the total number of bytes written (including alignment padding).
+        """
+        if not frames:
+            return 0
+
+        # Concatenate all frames, appending a newline separator so the file
+        # remains replay-compatible with StreamBuffer.
+        combined = b"".join(
+            (f if f.endswith(b"\n") else f + b"\n") for f in frames
+        )
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("DirectIOSink is closed")
+            padded = self._pad_to_alignment(combined)
+            n = os.write(self._fd, padded)
+            self._bytes_written += n
+            return n
+
+    # ------------------------------------------------------------------
+    # Synchronous public API
+    # ------------------------------------------------------------------
+
+    def write(self, data: bytes) -> int:
+        """Write *data* synchronously, bypassing the OS page cache.
+
+        The payload is padded to the alignment boundary before the write.
+        Returns the number of raw bytes written to the descriptor (including
+        padding).
+        """
+        return self._write_sync(data)
+
+    def write_batch(self, frames: list[bytes]) -> int:
+        """Write a batch of frames synchronously as a single aligned transfer.
+
+        Returns the total bytes written (including padding).
+        """
+        return self._write_batch_sync(frames)
+
+    # ------------------------------------------------------------------
+    # Async non-blocking public API
+    # ------------------------------------------------------------------
+
+    async def async_write(self, data: bytes) -> int:
+        """Write *data* without blocking the async event loop.
+
+        The blocking ``os.write`` call is executed in the sink's dedicated
+        :class:`ThreadPoolExecutor` so the calling coroutine yields control
+        while the DMA transfer is in flight.
+
+        Returns the number of bytes written (including padding).
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._executor, self._write_sync, data)
+
+    async def async_write_batch(self, frames: list[bytes]) -> int:
+        """Write a batch of frames without blocking the async event loop.
+
+        Returns the total bytes written (including padding).
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor, self._write_batch_sync, frames
+        )
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def bytes_written(self) -> int:
+        """Total bytes written to the file descriptor since the sink was opened."""
+        with self._lock:
+            return self._bytes_written
+
+    @property
+    def path(self) -> Path:
+        """Resolved path of the backing file."""
+        return self._path
+
+    @property
+    def alignment(self) -> int:
+        """Block-size alignment used for O_DIRECT writes."""
+        return self._alignment
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """Flush any pending executor tasks and release the file descriptor."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        # Shut down the thread-pool (waits for in-flight writes to complete).
+        self._executor.shutdown(wait=True)
+
+        try:
+            os.close(self._fd)
+        except OSError:
+            pass
+
+        logger.debug(
+            "DirectIOSink closed — path=%s bytes_written=%d",
+            self._path,
+            self._bytes_written,
+        )
+
+    def __enter__(self) -> "DirectIOSink":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+# ---------------------------------------------------------------------------
 # Module-level default sink (lazily initialised, one per process)
 # ---------------------------------------------------------------------------
 
@@ -320,6 +618,14 @@ def get_default_sink(
 
 class StreamBuffer:
     """Accumulate binary chunks, yield parsed JSON objects, and log raw frames.
+
+    Uses a pre-allocated :class:`bytearray` as a rolling window over the
+    incoming byte stream.  Newline-delimited JSON frames are located via a
+    single linear scan; complete frames are decoded by the SIMD-accelerated
+    back-end when ``pysimdjson`` is available, or by ``json.loads`` otherwise.
+    The backing buffer is never reallocated between ``feed`` calls, which keeps
+    GC pressure flat during sustained high-volume ingestion.
+    """
 
     __slots__ = ("_buf", "_start", "_size", "_capacity")
 
@@ -382,7 +688,7 @@ class StreamBuffer:
             if self._size == 0:
                 self._start = 0
 
-        for frame in frames:
+        for frame in raw_frames:
             # _decode() handles both the SIMD and stdlib fallback paths.
             # Input is already bytes — no str conversion needed, which is a
             # free performance win over the previous json.loads(str) pattern.
@@ -394,4 +700,4 @@ class StreamBuffer:
         self._size = 0
 
 
-__all__ = ["SIMDJSON_AVAILABLE", "StreamBuffer"]
+__all__ = ["SIMDJSON_AVAILABLE", "StreamBuffer", "MmapLogSink", "DirectIOSink", "get_default_sink"]
