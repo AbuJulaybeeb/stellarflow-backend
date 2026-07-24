@@ -34,6 +34,8 @@ Total frame size: 8 + 8 + 8 + 8 + 4 + 2 + 1 + 1 = 40 bytes
 import struct
 from typing import NamedTuple, Sequence, Union
 
+import msgpack
+
 # Format string & compile-time size
 # Using '<' for little-endian standard sizes and no implicit alignment padding.
 # The format '<8sqQQIHBB' defines the 40-byte unaligned layout:
@@ -47,6 +49,7 @@ from typing import NamedTuple, Sequence, Union
 # - B: 8-bit unsigned reserved byte
 _FRAME_STRUCT: struct.Struct = struct.Struct("<8sqQQIHBB")
 _FRAME_SIZE: int = _FRAME_STRUCT.size  # 40 bytes
+FRAME_SIZE: int = _FRAME_SIZE
 
 # Status-flag bitmask constants (uint16)
 FLAG_LIVE: int = 0x0001       # feed is live / real-time
@@ -163,28 +166,14 @@ def pack_frame(frame: TelemetryFrame) -> bytes:
 
 
 
-def pack_frame(frame: TelemetryFrame) -> bytes:
-    """Serialize a single TelemetryFrame into a FlatBuffers buffer."""
-    builder = flatbuffers.Builder(0)
-    
-    # Create asset_id vector
-    asset_bytes = frame.asset_id
-    asset_offset = builder.CreateByteVector(asset_bytes)
-    
-    # Build the TelemetryFrame
-    TelemetryFrameStart(builder)
-    TelemetryFrameAddAssetId(builder, asset_offset)
-    TelemetryFrameAddPrice(builder, frame.price)
-    TelemetryFrameAddVolume(builder, frame.volume)
-    TelemetryFrameAddTimestamp(builder, frame.timestamp)
-    TelemetryFrameAddSequence(builder, frame.sequence)
-    TelemetryFrameAddFlags(builder, frame.flags)
-    TelemetryFrameAddFeedId(builder, frame.feed_id)
-    frame_offset = TelemetryFrameEnd(builder)
-    
-    builder.Finish(frame_offset)
-    return bytes(builder.Output())
+def unpack_frame(data: bytes) -> TelemetryFrame:
+    """Unpack a raw 40-byte buffer back into a :class:`TelemetryFrame`.
 
+    Args:
+        data: A 40-byte buffer produced by :func:`pack_frame`.
+
+    Returns:
+        A populated :class:`TelemetryFrame` instance.
 
     Raises:
         struct.error: If ``data`` is shorter than ``FRAME_SIZE``.
@@ -603,6 +592,208 @@ class StructPackEncoder:
 
 
 # ---------------------------------------------------------------------------
+# Issue #628 — MsgPack binary serializer for Redis payload caching
+# ---------------------------------------------------------------------------
+# Uses msgpack with C-extensions for high-performance binary serialization
+# of Redis telemetry caches, reducing payload sizes by ~35%+ vs JSON strings.
+
+
+def msgpack_encode(obj: object) -> bytes:
+    """Encode *obj* into a compact msgpack binary payload.
+
+    Uses the C-accelerated ``msgpack.packb`` with ``use_bin_type=True`` so
+    that ``bytes`` values round-trip correctly and small integers are encoded
+    in their most compact wire representation.
+
+    Args:
+        obj: Any JSON-serialisable Python object (dict, list, int, float,
+             str, bytes, bool, None) — or any object supported by msgpack.
+
+    Returns:
+        A ``bytes`` object containing the msgpack-encoded representation.
+    """
+    return msgpack.packb(obj, use_bin_type=True, strict_types=True)
+
+
+def msgpack_decode(data: bytes) -> object:
+    """Decode a msgpack binary payload back into a Python object.
+
+    Args:
+        data: A ``bytes`` object previously produced by :func:`msgpack_encode`.
+
+    Returns:
+        The deserialised Python object.
+    """
+    return msgpack.unpackb(data, raw=False)
+
+
+_TELEMETRY_MSGPACK_VERSION: int = 1
+
+
+def msgpack_encode_telemetry_frame(frame: TelemetryFrame) -> bytes:
+    """Encode a :class:`TelemetryFrame` into a compact msgpack binary payload.
+
+    Uses a positional list layout (version byte + 7 values) to eliminate
+    per-key overhead and maximise compression — suitable for high-frequency
+    Redis telemetry caches where every byte counts.
+
+    Wire layout::
+
+        [version=1, asset_id, price, volume, timestamp, sequence, flags, feed_id]
+
+    Args:
+        frame: A populated :class:`TelemetryFrame` instance.
+
+    Returns:
+        A ``bytes`` object containing the msgpack-encoded frame.
+    """
+    return msgpack.packb(
+        [_TELEMETRY_MSGPACK_VERSION, frame.asset_id, frame.price,
+         frame.volume, frame.timestamp, frame.sequence, frame.flags,
+         frame.feed_id],
+        use_bin_type=True,
+        strict_types=True,
+    )
+
+
+def msgpack_decode_telemetry_frame(data: bytes) -> TelemetryFrame:
+    """Decode a msgpack payload back into a :class:`TelemetryFrame`.
+
+    Args:
+        data: A ``bytes`` object produced by
+              :func:`msgpack_encode_telemetry_frame`.
+
+    Returns:
+        A populated :class:`TelemetryFrame` instance.
+
+    Raises:
+        ValueError: If the version byte is unrecognised.
+    """
+    items = msgpack.unpackb(data, raw=False)
+    version = items[0]
+    if version != _TELEMETRY_MSGPACK_VERSION:
+        raise ValueError(f"Unsupported telemetry msgpack version: {version}")
+    return TelemetryFrame(
+        asset_id=items[1] if isinstance(items[1], bytes) else items[1].encode("ascii"),
+        price=items[2],
+        volume=items[3],
+        timestamp=items[4],
+        sequence=items[5],
+        flags=items[6],
+        feed_id=items[7],
+    )
+
+
+_RING_BUFFER_MSGPACK_VERSION: int = 1
+
+
+def msgpack_encode_ring_buffer_metric(metric: RingBufferMetric) -> bytes:
+    """Encode a :class:`RingBufferMetric` into a compact msgpack binary payload.
+
+    Uses a positional list layout for minimal wire size.
+
+    Args:
+        metric: A populated :class:`RingBufferMetric` instance.
+
+    Returns:
+        A ``bytes`` object containing the msgpack-encoded metric.
+    """
+    return msgpack.packb(
+        [_RING_BUFFER_MSGPACK_VERSION, metric.size, metric.capacity,
+         metric.utilization, metric.total_enqueued, metric.total_dequeued,
+         metric.enqueue_failures, metric.dequeue_failures, metric.avg_latency_us,
+         metric.peak_latency_us, metric.batches_processed],
+        use_bin_type=True,
+        strict_types=True,
+    )
+
+
+def msgpack_decode_ring_buffer_metric(data: bytes) -> RingBufferMetric:
+    """Decode a msgpack payload back into a :class:`RingBufferMetric`.
+
+    Args:
+        data: A ``bytes`` object produced by
+              :func:`msgpack_encode_ring_buffer_metric`.
+
+    Returns:
+        A populated :class:`RingBufferMetric` instance.
+    """
+    items = msgpack.unpackb(data, raw=False)
+    version = items[0]
+    if version != _RING_BUFFER_MSGPACK_VERSION:
+        raise ValueError(f"Unsupported ring-buffer msgpack version: {version}")
+    return RingBufferMetric(
+        size=items[1],
+        capacity=items[2],
+        utilization=items[3],
+        total_enqueued=items[4],
+        total_dequeued=items[5],
+        enqueue_failures=items[6],
+        dequeue_failures=items[7],
+        avg_latency_us=items[8],
+        peak_latency_us=items[9],
+        batches_processed=items[10],
+    )
+
+
+_BACKPRESSURE_MSGPACK_VERSION: int = 1
+
+
+def msgpack_encode_backpressure_metric(metric: BackpressureMetric) -> bytes:
+    """Encode a :class:`BackpressureMetric` into a compact msgpack binary payload.
+
+    Uses a positional list layout for minimal wire size.
+
+    Args:
+        metric: A populated :class:`BackpressureMetric` instance.
+
+    Returns:
+        A ``bytes`` object containing the msgpack-encoded metric.
+    """
+    return msgpack.packb(
+        [_BACKPRESSURE_MSGPACK_VERSION, metric.queue_length, metric.max_capacity,
+         metric.saturation, metric.dropped_packets, metric.slowed_ingestions,
+         metric.avg_processing_us],
+        use_bin_type=True,
+        strict_types=True,
+    )
+
+
+def msgpack_decode_backpressure_metric(data: bytes) -> BackpressureMetric:
+    """Decode a msgpack payload back into a :class:`BackpressureMetric`.
+
+    Args:
+        data: A ``bytes`` object produced by
+              :func:`msgpack_encode_backpressure_metric`.
+
+    Returns:
+        A populated :class:`BackpressureMetric` instance.
+    """
+    items = msgpack.unpackb(data, raw=False)
+    version = items[0]
+    if version != _BACKPRESSURE_MSGPACK_VERSION:
+        raise ValueError(f"Unsupported backpressure msgpack version: {version}")
+    return BackpressureMetric(
+        queue_length=items[1],
+        max_capacity=items[2],
+        saturation=items[3],
+        dropped_packets=items[4],
+        slowed_ingestions=items[5],
+        avg_processing_us=items[6],
+    )
+
+
+def msgpack_json_size(data: object) -> int:
+    """Return the byte length of *data* encoded as a JSON string.
+
+    This is a convenience helper for comparison tests that need the JSON
+    baseline size alongside the msgpack size.
+    """
+    import json
+    return len(json.dumps(data, separators=(",", ":")).encode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
 # Public API
 __all__ = [
     "TelemetryFrame",
@@ -632,4 +823,14 @@ __all__ = [
     "FRAME_SIZE",
     # Issue #613 — struct-pack IPC encoder
     "StructPackEncoder",
+    # Issue #628 — msgpack binary serializer for Redis caching
+    "msgpack_encode",
+    "msgpack_decode",
+    "msgpack_encode_telemetry_frame",
+    "msgpack_decode_telemetry_frame",
+    "msgpack_encode_ring_buffer_metric",
+    "msgpack_decode_ring_buffer_metric",
+    "msgpack_encode_backpressure_metric",
+    "msgpack_decode_backpressure_metric",
+    "msgpack_json_size",
 ]
