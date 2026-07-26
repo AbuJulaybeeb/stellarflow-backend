@@ -46,8 +46,8 @@ export const latencyValidationMiddleware = async (
         `[LatencyGuard] Invalid timestamp format in relayer payload: ${payloadTimestamp}`,
       );
       await logLatencyViolation(
-        req.relayer.id,
-        req.relayer.name,
+        req.relayer?.id ?? null,
+        req.relayer?.name ?? null,
         "INVALID_TIMESTAMP",
         payloadTimestamp,
         null,
@@ -71,8 +71,8 @@ export const latencyValidationMiddleware = async (
 
       // Log the violation to ComplianceMetadataStore
       await logLatencyViolation(
-        req.relayer.id,
-        req.relayer.name,
+        req.relayer?.id ?? null,
+        req.relayer?.name ?? null,
         "LATENCY_VIOLATION",
         payloadTimestamp,
         latencyDiff,
@@ -108,8 +108,8 @@ export const latencyValidationMiddleware = async (
     
     // Log the error as a violation for auditing
     await logLatencyViolation(
-      req.relayer.id,
-      req.relayer.name,
+      req.relayer?.id ?? null,
+      req.relayer?.name ?? null,
       "VALIDATION_ERROR",
       payloadTimestamp,
       null,
@@ -125,8 +125,8 @@ export const latencyValidationMiddleware = async (
  * Logs a latency violation to the ComplianceMetadataStore for auditing.
  */
 async function logLatencyViolation(
-  relayerId: number | undefined,
-  relayerName: string | undefined,
+  relayerId: number | null,
+  relayerName: string | null,
   eventType: string,
   payloadTimestamp: string | null,
   latencyDiffMs: number | null,
@@ -136,8 +136,8 @@ async function logLatencyViolation(
   try {
     await prisma.complianceMetadata.create({
       data: {
-        relayerId: relayerId,
-        relayerName: relayerName,
+        relayerId,
+        relayerName,
         eventType,
         payloadTimestamp: payloadTimestamp ? new Date(payloadTimestamp) : null,
         receivedAt: new Date(),
@@ -208,7 +208,7 @@ export async function getRelayerLatencyStats(relayerName: string) {
 
   // Calculate average latency of violations
   const avgLatency = recentViolations.length > 0
-    ? recentViolations.reduce((sum, v) => sum + (v.latencyDiffMs || 0), 0) / recentViolations.length
+    ? recentViolations.reduce((sum: number, v: { latencyDiffMs: number | null }) => sum + (v.latencyDiffMs || 0), 0) / recentViolations.length
     : 0;
 
   return {
