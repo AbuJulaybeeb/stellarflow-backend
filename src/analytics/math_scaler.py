@@ -67,6 +67,29 @@ def floor_divide(scaled_value: int, divisor: Union[int, float]) -> int:
     return (scaled_value * SCALE_7) // divisor_int
 
 
+def rate_to_log_scaled(rate: Union[int, float], scale: int = SCALE_14) -> int:
+    """Convert an exchange rate to an integer-scaled logarithmic weight.
+    
+    Returns the negative natural logarithm of the rate, scaled by `scale`.
+    This allows multi-hop route scoring to use integer addition rather than
+    cumulative multiplication, avoiding precision loss and allowing shortest-path
+    algorithms to find the most profitable routes.
+    """
+    if rate <= 0:
+        raise ValueError("Rate must be strictly positive.")
+    return math.floor(-math.log(rate) * scale)
+
+
+def add_log_scaled(*weights: int) -> int:
+    """Add multiple integer-scaled logarithmic weights together."""
+    return sum(weights)
+
+
+def log_scaled_to_rate(log_weight: int, scale: int = SCALE_14) -> float:
+    """Convert a scaled logarithmic weight back to an exchange rate."""
+    return math.exp(-log_weight / scale)
+
+
 __all__ = [
     "SCALE_7",
     "SCALE_14",
@@ -75,4 +98,7 @@ __all__ = [
     "multiply_rates",
     "cross_feed_multiply",
     "floor_divide",
+    "rate_to_log_scaled",
+    "add_log_scaled",
+    "log_scaled_to_rate",
 ]
