@@ -15,7 +15,7 @@ Converts high-frequency structural metrics arrays into dense binary byte
 arrays using Python's native ``struct`` library, eliminating the CPU and
 bandwidth overhead of JSON serialisation for local microservice communications.
 
-Frame layout (little-endian, tightly-packed — no implicit C-struct padding):
+Frame layout (big-endian, tightly-packed — no implicit C-struct padding):
 ┌─────────────┬────────┬──────────────────────────────────────────────────────┐
 │ Field        │ Format │ Description                                          │
 ├─────────────┼────────┼──────────────────────────────────────────────────────┤
@@ -26,9 +26,8 @@ Frame layout (little-endian, tightly-packed — no implicit C-struct padding):
 │ sequence    │   I    │ uint32 monotonic sequence / nonce counter             │
 │ flags       │   H    │ uint16 status-flag bitmask                           │
 │ feed_id     │   B    │ uint8  originating data-feed identifier               │
-│ _reserved   │   B    │ uint8  reserved byte (always 0x00, for alignment)    │
 └─────────────┴────────┴──────────────────────────────────────────────────────┘
-Total frame size: 8 + 8 + 8 + 8 + 4 + 2 + 1 + 1 = 40 bytes
+Total frame size: 8 + 8 + 8 + 8 + 4 + 2 + 1 = 39 bytes
 """
 
 import struct
@@ -37,8 +36,8 @@ from typing import NamedTuple, Sequence, Union
 import msgpack
 
 # Format string & compile-time size
-# Using '<' for little-endian standard sizes and no implicit alignment padding.
-# The format '<8sqQQIHBB' defines the 40-byte unaligned layout:
+# Using '>' for network-order standard sizes and no implicit alignment padding.
+# The format '>8sqQQIHB' defines the 39-byte unaligned layout:
 # - 8s: 8-byte asset identifier
 # - q: 64-bit signed scaled price
 # - Q: 64-bit unsigned scaled volume
@@ -108,7 +107,6 @@ class TelemetryEncoder:
             frame.sequence,
             frame.flags,
             frame.feed_id,
-            0,
         )
 
     @classmethod
@@ -148,7 +146,7 @@ class TelemetryEncoder:
 
 
 def pack_frame(frame: TelemetryFrame) -> bytes:
-    """Serialise one :class:`TelemetryFrame` into a compact 40-byte buffer.
+    """Serialise one :class:`TelemetryFrame` into a compact 39-byte buffer.
 
     The output is a raw binary byte-string with no delimiters, no length
     prefix, and no JSON overhead — ready for direct socket/queue transmission.
@@ -157,7 +155,7 @@ def pack_frame(frame: TelemetryFrame) -> bytes:
         frame: A populated :class:`TelemetryFrame` instance.
 
     Returns:
-        A 40-byte ``bytes`` object representing the packed frame.
+        A 39-byte ``bytes`` object representing the packed frame.
 
     Raises:
         struct.error: If any field value is out of range for its C-type.
@@ -212,13 +210,8 @@ def unpack_bundle(data: bytes) -> list[TelemetryFrame]:
 
 
 def bundle_frame_count(data: bytes) -> int:
-    """Return the number of frames present in a FlatBuffers bundle buffer."""
-    try:
-        buf = bytearray(data)
-        flat_bundle = FlatTelemetryBundle.GetRootAs(buf, 0)
-        return flat_bundle.FramesLength()
-    except Exception:
-        return 0
+    """Return the number of complete packed frames in a struct bundle buffer."""
+    return len(data) // FRAME_SIZE
 
 
 def encode_asset_id(symbol: str) -> bytes:
@@ -237,7 +230,7 @@ def decode_asset_id(asset_bytes: bytes) -> str:
 # ---------------------------------------------------------------------------
 # Additional payload formats written to local message channels.
 #
-# RingBufferMetric layout (little-endian, no padding):
+# RingBufferMetric layout (big-endian, no padding):
 # ┌──────────────────┬───────┬──────────────────────────────────────────────┐
 # │ Field             │ Fmt   │ Description                                  │
 # ├──────────────────┼───────┼──────────────────────────────────────────────┤
@@ -253,10 +246,10 @@ def decode_asset_id(asset_bytes: bytes) -> str:
 # │ batches_processed│  Q    │ uint64  total batches flushed                 │
 # └──────────────────┴───────┴──────────────────────────────────────────────┘
 # Total: 10 × 8 = 80 bytes
-_RBM_FMT: str = "<QQqQQQQqqQ"
+_RBM_FMT: str = ">QQqQQQQqqQ"
 _RBM_SIZE: int = struct.calcsize(_RBM_FMT)  # 80 bytes
 
-# BackpressureMetric layout (little-endian, no padding):
+# BackpressureMetric layout (big-endian, no padding):
 # ┌──────────────────────┬───────┬──────────────────────────────────────────┐
 # │ Field                 │ Fmt   │ Description                              │
 # ├──────────────────────┼───────┼──────────────────────────────────────────┤
@@ -268,7 +261,7 @@ _RBM_SIZE: int = struct.calcsize(_RBM_FMT)  # 80 bytes
 # │ avg_processing_us    │  q    │ int64   average processing time µs ×10⁷  │
 # └──────────────────────┴───────┴──────────────────────────────────────────┘
 # Total: 6 × 8 = 48 bytes
-_BPM_FMT: str = "<QQqQQq"
+_BPM_FMT: str = ">QQqQQq"
 _BPM_SIZE: int = struct.calcsize(_BPM_FMT)  # 48 bytes
 
 # IPCHeader layout — prepended to every channel write for framing:
@@ -283,12 +276,12 @@ _BPM_SIZE: int = struct.calcsize(_BPM_FMT)  # 48 bytes
 # │ timestamp_ms     │  Q    │ uint64  Unix epoch ms at write time          │
 # └──────────────────┴───────┴──────────────────────────────────────────────┘
 # Total: 2 + 1 + 1 + 4 + 8 + 8 = 24 bytes
-_HDR_FMT: str = "<HBBIQQ"
+_HDR_FMT: str = ">HBBIQQ"
 _HDR_SIZE: int = struct.calcsize(_HDR_FMT)  # 24 bytes
 _HDR_MAGIC: int = 0xBEEF
 
 # Payload-type identifiers (uint8, stored in header.payload_type)
-IPC_TYPE_TELEMETRY_FRAME: int = 0x01    # single TelemetryFrame (40 bytes)
+IPC_TYPE_TELEMETRY_FRAME: int = 0x01    # single TelemetryFrame (39 bytes)
 IPC_TYPE_TELEMETRY_BUNDLE: int = 0x02   # concatenated TelemetryFrame bundle
 IPC_TYPE_RING_BUFFER_METRIC: int = 0x03 # RingBufferMetric snapshot (80 bytes)
 IPC_TYPE_BACKPRESSURE_METRIC: int = 0x04 # BackpressureMetric snapshot (48 bytes)
@@ -438,7 +431,7 @@ class StructPackEncoder:
     def encode_telemetry_frame(self, frame: TelemetryFrame) -> bytes:
         """Encode one :class:`TelemetryFrame` with its IPC header.
 
-        Returns a ``FRAME_SIZE + _HDR_SIZE`` (64-byte) buffer: header
+        Returns a ``FRAME_SIZE + _HDR_SIZE`` (63-byte) buffer: header
         immediately followed by the packed frame payload — no delimiters,
         no length-prefix duplication, ready for direct queue write.
 
@@ -446,7 +439,7 @@ class StructPackEncoder:
             frame: A populated :class:`TelemetryFrame` instance.
 
         Returns:
-            A 64-byte raw binary buffer (24-byte header + 40-byte payload).
+            A 63-byte raw binary buffer (24-byte header + 39-byte payload).
         """
         payload = pack_frame(frame)
         return self._pack_header(IPC_TYPE_TELEMETRY_FRAME, len(payload)) + payload
@@ -454,7 +447,7 @@ class StructPackEncoder:
     def encode_telemetry_bundle(self, frames: Sequence[TelemetryFrame]) -> bytes:
         """Encode a batch of :class:`TelemetryFrame` objects with one IPC header.
 
-        The bundle payload is a simple concatenation of fixed-size 40-byte
+        The bundle payload is a simple concatenation of fixed-size 39-byte
         frames — identical to :func:`pack_bundle` output — prefixed with a
         single header whose ``payload_len`` covers the entire batch.
 
@@ -462,7 +455,7 @@ class StructPackEncoder:
             frames: An ordered sequence of :class:`TelemetryFrame` instances.
 
         Returns:
-            A ``(24 + len(frames) * 40)``-byte raw binary buffer.
+            A ``(24 + len(frames) * 39)``-byte raw binary buffer.
         """
         payload = pack_bundle(frames)
         return self._pack_header(IPC_TYPE_TELEMETRY_BUNDLE, len(payload)) + payload
