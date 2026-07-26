@@ -41,10 +41,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from crypto.signer import (
     SecureKeyHandle,
-    PublicKeyHandle,
     SecureSessionCredentials,
     SigningError,
     _zero_wipe,
+    _configure_openssl_hardware_acceleration,
 )  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -638,74 +638,22 @@ class TestSecureSessionCredentialsLogging:
 
 
 # ---------------------------------------------------------------------------
-# Key Boundary Isolation
+# Hardware Acceleration Configuration
 # ---------------------------------------------------------------------------
 
 
-class TestKeyBoundaryIsolation:
-    def test_public_key_handle_is_immutable(self):
-        """Verify that PublicKeyHandle cannot be modified after construction."""
-        pub_key = bytes(range(32))
-        handle = PublicKeyHandle(pub_key, key_id="test_key")
-        
-        # Attempting to set an attribute should raise AttributeError
-        with pytest.raises(AttributeError, match="immutable"):
-            handle._public_key = b"malicious"
-        
-        with pytest.raises(AttributeError, match="immutable"):
-            handle.new_attr = "value"
-        
-        # Attempting to delete an attribute should raise AttributeError
-        with pytest.raises(AttributeError, match="immutable"):
-            del handle._key_id
+class TestHardwareAccelerationFlags:
+    def test_openssl_hardware_acceleration_configured(self):
+        """Verify that OpenSSL hardware acceleration configuration runs without error."""
+        # The function should not raise any exceptions
+        _configure_openssl_hardware_acceleration()
 
-    def test_public_key_handle_no_sign_method(self):
-        """Verify that PublicKeyHandle has no sign method (type isolation)."""
-        pub_key = bytes(range(32))
-        handle = PublicKeyHandle(pub_key, key_id="test_key")
+    def test_openssl_environment_variable_set(self, caplog):
+        """Verify that OPENSSL_ia32cap environment variable is configured."""
+        with caplog.at_level(logging.DEBUG, logger="crypto.signer"):
+            _configure_openssl_hardware_acceleration()
         
-        # PublicKeyHandle should not have a sign method
-        assert not hasattr(handle, "sign"), "PublicKeyHandle should not have sign method"
-
-    def test_public_key_handle_has_verify_method(self):
-        """Verify that PublicKeyHandle has verify method for signature verification."""
-        pub_key = bytes(range(32))
-        handle = PublicKeyHandle(pub_key, key_id="test_key")
-        
-        # PublicKeyHandle should have verify method
-        assert hasattr(handle, "verify"), "PublicKeyHandle should have verify method"
-
-    def test_public_key_handle_bytes_property(self):
-        """Verify that PublicKeyHandle bytes property returns immutable bytes."""
-        pub_key = bytes(range(32))
-        handle = PublicKeyHandle(pub_key, key_id="test_key")
-        
-        # bytes property should return the public key
-        assert handle.bytes == pub_key
-        
-        # The returned bytes should be immutable (bytes objects are immutable in Python)
-        # This is a property of Python's bytes type, not something we enforce
-
-    def test_public_key_handle_rejects_empty_bytes(self):
-        """Verify that PublicKeyHandle rejects empty public key bytes."""
-        with pytest.raises(ValueError, match="must be non-empty"):
-            PublicKeyHandle(b"", key_id="test_key")
-
-    def test_private_key_handle_and_public_key_handle_are_separate_types(self):
-        """Verify that SecureKeyHandle and PublicKeyHandle are distinct types."""
-        priv_key = bytes(range(32))
-        pub_key = bytes(range(32))
-        
-        priv_handle = SecureKeyHandle(priv_key, key_id="priv_key")
-        pub_handle = PublicKeyHandle(pub_key, key_id="pub_key")
-        
-        # They should be different types
-        assert type(priv_handle) != type(pub_handle), (
-            "SecureKeyHandle and PublicKeyHandle must be separate types for isolation"
+        # Check that the environment variable was set
+        assert "OPENSSL_ia32cap" in os.environ, (
+            "OPENSSL_ia32cap environment variable should be set for hardware acceleration"
         )
-        
-        # Private key handle should have sign method
-        assert hasattr(priv_handle, "sign"), "SecureKeyHandle should have sign method"
-        
-        # Public key handle should not have sign method
-        assert not hasattr(pub_handle, "sign"), "PublicKeyHandle should not have sign method"

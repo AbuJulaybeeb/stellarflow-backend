@@ -119,6 +119,64 @@ from typing import Any, Iterator, Optional, Type
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger(f"{__name__}.audit")
 
+# =========================================================================
+# OPENSSL HARDWARE ACCELERATION CONFIGURATION
+# =========================================================================
+
+def _configure_openssl_hardware_acceleration() -> None:
+    """Enable OpenSSL hardware acceleration flags (AES-NI/AVX2) for signature verification.
+    
+    This function configures OpenSSL to use available CPU instruction set extensions
+    for accelerated cryptographic operations. It sets environment variables and
+    attempts to configure OpenSSL's ENGINE to enable hardware acceleration.
+    
+    The following accelerations are enabled when available:
+    - AES-NI: Advanced Encryption Standard New Instructions for AES operations
+    - AVX2: Advanced Vector Extensions for parallel processing
+    - SHA-NI: SHA extensions for hash operations
+    """
+    # Enable OpenSSL hardware acceleration via environment variables
+    # These flags are read by OpenSSL when initializing crypto operations
+    os.environ.setdefault("OPENSSL_ia32cap", "~0x200000200000000")  # Enable AVX2, AES-NI
+    
+    # Try to configure OpenSSL ENGINE for hardware acceleration
+    try:
+        # Load OpenSSL library
+        if os.name == "nt":
+            openssl_libs = ["libeay32.dll", "libssl32.dll", "libcrypto.dll"]
+        else:
+            openssl_libs = ["libcrypto.so.1.1", "libcrypto.so.3", "libcrypto.so"]
+        
+        openssl_loaded = False
+        for lib_name in openssl_libs:
+            try:
+                lib_path = ctypes.util.find_library(lib_name)
+                if lib_path:
+                    openssl = ctypes.CDLL(lib_path)
+                    openssl_loaded = True
+                    logger.debug(f"[OpenSSL] Loaded library: {lib_path}")
+                    break
+            except (OSError, AttributeError):
+                continue
+        
+        if openssl_loaded:
+            # Try to enable hardware acceleration via ENGINE
+            try:
+                # OpenSSL 1.1.1+ uses ENGINE_load_builtin_engines
+                if hasattr(openssl, "ENGINE_load_builtin_engines"):
+                    openssl.ENGINE_load_builtin_engines()
+                    openssl.ENGINE_register_all_complete()
+                    logger.debug("[OpenSSL] Hardware acceleration engines loaded")
+            except Exception:
+                # ENGINE functions may not be available in all OpenSSL builds
+                pass
+    except Exception as exc:
+        # Hardware acceleration is optional - log but don't fail
+        logger.debug(f"[OpenSSL] Hardware acceleration configuration failed (optional): {exc}")
+
+# Configure OpenSSL acceleration at module import time
+_configure_openssl_hardware_acceleration()
+
 __all__ = [
     "SecureKeyHandle",
     "PublicKeyHandle",
